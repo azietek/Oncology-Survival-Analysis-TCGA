@@ -1,0 +1,220 @@
+---
+title: 'Survival Analysis: Impact of TNBC Subtype on Breast Cancer Prognosis'
+author: "Aleksandra Zietek"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  toc: true
+  html_document: null
+toc_float: true
+theme: flatly
+highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(survival)
+library(stringr)
+library(survminer)
+```
+
+# Introduction and Clinical Objective
+
+In breast cancer oncology, treatment paths and prognosis are heavily dictated by receptor status:
+
+-   Estrogen Receptor (ER)
+-   Progesterone Receptor (PR)
+-   Human Epidermal Growth Factor Receptor 2 (HER2).
+
+Patients testing negative for all three (Triple-Negative Breast Cancer - TNBC) historically experience poorer outcomes.
+
+**Objective:** Investigate the effect of the TNBC phenotype on Overall Survival (OS) using the TCGA-BRCA cohort, adjusting for age and pathological stage.
+
+# Data loading and preprocessing
+
+We load the raw clinical dataset and construct the key variables required for survival analysis. From the full clinical table, we select variables related to survival outcomes, clinical confounders, and molecular biomarkers.
+
+## Survival Endpoints
+
+-   *vital_status* - indicates whether the patient is alive or deceased at last follow-up,
+
+-   *death_days_to* - number of days from initial diagnosis to death (available only for deceased patients),
+
+-   *last_contact_days_to* - number of days from diagnosis to the last known clinical follow-up (used for patients who are still alive or censored cases).
+
+These variables are used to construct overall survival time and censoring status for survival modeling.
+
+## Clinical confounders
+
+-   *age_at_diagnosis* - patient age at the time of initial cancer diagnosis, an important prognostic factor in breast cancer outcomes,
+
+-   *ajcc_pathologic_tumor_stage* - tumor stage defined according to the AJCC staging system, reflecting disease progression and tumor burden.
+
+# Molecular biomarkers
+
+-   *er_status_by_ihc* - estrogen receptor (ER) status determined by IHC, indicating whether tumor cells express estrogen receptors,
+
+-   *pr_status_by_ihc* - progesterone receptor (PR) status measured by IHC,
+
+-   *her2_status_by_ihc* - human epidermal growth factor receptor 2 (HER2) status assessed by IHC
+
+```{r load_data}
+raw_df <- readRDS("data/raw_clinical_brca.rds")
+
+df <- raw_df %>% select(bcr_patient_barcode,
+                        vital_status, death_days_to, last_contact_days_to,
+                        age_at_diagnosis, ajcc_pathologic_tumor_stage,
+                        er_status_by_ihc, pr_status_by_ihc, her2_status_by_ihc) %>%
+  mutate(death_days_to = as.numeric(death_days_to),
+         last_contact_days_to = as.numeric(last_contact_days_to),
+         age = as.numeric(age_at_diagnosis),
+         # key variables: status death = event or alive = censored
+         status = ifelse(vital_status == "Dead", 1, 0), 
+         # key variables: if patient died - real survival time until event
+         # otherwise last time confirmed they were alive (censored)
+         time = ifelse(status == 1, death_days_to, last_contact_days_to)
+         ) %>%
+  filter(time > 0) %>% select(-age_at_diagnosis)
+```
+
+# Defining Molecular Subtypes (TNBC)
+
+We define TNBC based on the negative receptor status for ER, PR and HER2.
+
+```{r mol_subtypes}
+df_analysis <- df %>%
+  mutate(subtype = case_when(
+    er_status_by_ihc == "Negative" &
+      pr_status_by_ihc == "Negative" &
+      (her2_status_by_ihc == "Negative" | her2_status_by_ihc == "Equivocal") ~ "TNBC",
+    er_status_by_ihc == "Positive" | pr_status_by_ihc == "Positive" | her2_status_by_ihc == "Positive" ~ "Non-TNBC",
+    
+    TRUE ~ NA_character_ # unknown
+  )) %>%
+  filter(!is.na(subtype)) %>%
+  mutate(stage = case_when(
+    str_detect(ajcc_pathologic_tumor_stage, "Stage I$|Stage IA|Stage IB") ~ "Stage I",
+    str_detect(ajcc_pathologic_tumor_stage, "Stage II$|Stage IIA|Stage IIB") ~ "Stage II",
+    str_detect(ajcc_pathologic_tumor_stage, "Stage III$|Stage IIIA|Stage IIIB|Stage IIIC") ~ "Stage III",
+    str_detect(ajcc_pathologic_tumor_stage, "Stage IV") ~ "Stage IV",
+    TRUE ~ NA_character_
+  )) %>%
+  filter(!is.na(stage))
+
+df_analysis$subtype <- factor(df_analysis$subtype, levels = c("Non-TNBC", "TNBC"))
+df_analysis$stage <- factor(df_analysis$stage, levels = c("Stage I", "Stage II", "Stage III", "Stage IV"))
+```
+
+# Non-Parametric Survival Analysis
+
+We construct the Kaplan-Meier survival curves to visually compare the survival probability between TNBC and Non-TNBC patients over time.
+
+```{r km_est}
+km_fit <- survfit(Surv(time, status) ~ subtype, data = df_analysis)
+
+ggsurvplot(
+  km_fit, 
+  data = df_analysis,
+  pval = TRUE,             
+  conf.int = TRUE,         
+  risk.table = TRUE,       
+  legend.labs = c("Non-TNBC", "TNBC"),
+  palette = c("#2E9FDF", "#E7B800"),
+  title = "Overall Survival: TNBC vs Non-TNBC Subtypes",
+  xlab = "Time (Days)",
+  ylab = "Survival Probability"
+)
+
+df_analysis %>% select(subtype, status) %>% table()
+```
+
+In this study, we compared overall survival between TNBC and non-TNBC patients using a non-parametric survival analysis framework based on Kaplan–Meier estimation and the log-rank test.
+
+Consistent with clinical expectations, patients with triple-negative breast cancer (TNBC) exhibited lower overall survival compared to non-TNBC patients. This observation aligns with the known aggressive biology of TNBC, which lacks hormone receptor and HER2 expression, thereby limiting the availability of targeted therapies.
+
+Although the log-rank test for overall survival suggested a borderline difference between groups ($p_{value} = 0.095$), the result did not reach the conventional significance threshold ($\alpha = 0.05$). This lack of statistical significance is likely attributable to substantial right-censoring and limited follow-up typical of the TCGA-BRCA cohort, in which overall survival times are generally long and event rates are relatively low. In particular, the small number of observed deaths in the TNBC group reduces statistical power to detect group differences.
+
+Despite this, the Kaplan–Meier curves show a consistent separation between groups over time, with lower survival probabilities observed in the TNBC cohort. At extended follow-up, the estimated survival probability for the TNBC group approaches zero, with the last observed estimate given by $\hat{S}(3472)=0.$
+
+# Semi-Parametric Modeling
+
+```{r cox}
+df_clean <- as.data.frame(df_analysis)
+
+cox_model <- coxph(
+  Surv(time, status) ~ subtype + age + stage,
+  data = df_clean
+)
+
+ggforest(cox_model, data = df_clean, noDigits = 3)
+```
+
+Hazard Ratio (HR) compares the instantaneous risk of an event (death) between groups. We observe that patients in Stage IV have a 5.37-fold higher risk compared to Stage I, while Stage III is associated with a 2.50-fold increase. In contrast, no meaningful difference is seen between Stage II and Stage I.
+
+Triple-negative breast cancer (TNBC) is associated with a 2.14 times higher risk of death at any point in time compared to non-TNBC, and this result is statistically significant ($p_{value} = 0.0106$).
+
+Additionally, the HR for age is 1.03 per one-year increase, with $p_{value} < 0.001$, indicating that the risk of death increases slightly with each additional year of age. This effect is cumulative; for example, over 10 years, the risk increases by approximately `r round((1.03^10 - 1) * 100)` %.
+
+# Model Diagnostics
+
+```{r zph}
+ph_test <- cox.zph(cox_model)
+print(ph_test)
+```
+The proportional hazard (PH) assumption in the Cox regression model states that the HR between groups remains constant over time testing following hypothesis
+
+$$H_0: \text{PH assumption is statisfied (no time-varying effect)}$$
+VS
+
+$$H_A: \text{PH assumption is violated (effect changes over time)}.$$
+From the results, there is no evidence of violation for the *subtype* variable, indicating that its effect on the hazard is consistent over time. The *age* variable shows a borderline result, suggesting a possible weak time-dependent effect. In contrast, *stage* shows a statistically significant violation of the PH assumption, meaning its effect on the hazard changes over time. As a result, the global test is also significant, indicating that the proportional hazards assumption is violated for the model overall.
+
+# Parametric Survival Modeling
+
+Because the PH assumption is not satisdied, we decided to use a parametric Weibull model to further examine the survival patterns.
+
+```{r weilbull}
+parametric_model <- survreg(Surv(time, status) ~ subtype + age + stage, 
+                            data = df_analysis, 
+                            dist = "weibull")
+
+model_summary <- summary(parametric_model)
+
+results_table <- data.frame(
+  Variable = rownames(model_summary$table),
+  Acceleration_Factor = exp(model_summary$table[, "Value"]),
+  P_Value = model_summary$table[, "p"]
+)
+
+print(results_table)
+```
+
+For *age* variable, the acceleration factor (AF) is 0.98, which means that each additional year of age after diagnosis reduces the expected survival time by  $2\%$. The change is statistically significant with $p_{value} < 0.001 < 0.05 = \alpha.$
+
+For the *TNBC subtype*, the AF is 0.62, indicating that patients with triple-negative breast cancer have about 38% shorter expected survival time compared to Non-TNBC patients with $p_{value} = 0.0108 < 0.05 = alpha$.
+
+When comparing cancer stages to Stage I, the results show progressively higher risk: Stage II is associated with a 4% reduction in the expected survival time (statistically not significant: $p_{value} = 0.8704 > 0.05 = \alpha$), Stage III with a 44% reduction ($p_{value} = 0.0125 < 0.05 = \alpha$), and Stage IV with a 68% reduction ($p_{value} < 0.001 < 0.05 = \alpha$) in the expected survival time.
+
+# Conclusions
+
+**Core Question:** *Does the TNBC phenotype significantly increase the hazard ratio of death when adjusting for age and pathological stage?*
+
+Within the finalized Weibull Accelerated Failure Time (AFT) framework, the TNBC phenotype is evaluated through its Acceleration Factor (AF) rather than a constant Hazard Ratio (HR), due to the non-proportional hazards observed in clinical staging.
+
+The analysis confirms that the TNBC phenotype does significantly worsen patient prognosis when adjusting for age and pathological stage. The model yielded an Acceleration Factor for TNBC of 0.62 ($p_{value} = 0.0108$), meaning that patients with Triple-Negative Breast Cancer experience a significant 38% reduction in expected survival time compared to the Non-TNBC cohort, holding all other clinical covariates constant. In clinical terms, the *time-to-event clock* moves significantly faster for TNBC patients.
+
+
+As expected, advancing staging acted as the strongest driver of accelerated time-to-death. Stage IV patients exhibited an acute and drastic reduction in expected survival time ($AF = 0.32, \hspace{2mm} p_{value} < 0.001$) relative to Stage I.
+
+Increased age at diagnosis was also a statistically significant, predictor of shortened survival time ($AF = 0.98, \hspace{2mm} p_{value} < 0.001$).
+
+While the initial unadjusted Kaplan-Meier analysis showed a borderline trend ($p_{value} = 0.095$), the true prognostic impact of the TNBC molecular subtype became clear and statistically significant only after adjusting for confounding factors in the multivariate parametric model.
+
+Furthermore, transitioning from a semi-parametric Cox model to a parametric Weibull model successfully resolved the mathematical violations imposed by the time-dependent effects of tumor staging. In a pharmaceutical setting, this Weibull framework provides the added benefit of survival extrapolation, allowing health economists to project long-term survival curves beyond the median follow-up limit of the TCGA database.
+
+# References
+
+- National Cancer Institute. Tests for breast cancer biomarkers. Bethesda (MD): National Cancer Institute; 2025 Dec 2
+
+- Irvin WJ Jr, Carey LA. What is triple-negative breast cancer? Eur J Cancer. 2008 Dec;44(18):2799-805. 
